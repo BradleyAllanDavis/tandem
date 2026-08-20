@@ -15,12 +15,6 @@
         import ./deploy/nix/module.nix (args // { src = self; });
       nixosModules.default = self.nixosModules.tandem-hub;
 
-      # A member's spoke as a nix-darwin module: mine.services.tandem-spoke
-      # (declarative counterpart to deploy/jill's imperative install.sh, for
-      # a member on a nix-managed Mac).
-      darwinModules.tandem-spoke = { config, lib, pkgs, ... }@args:
-        import ./deploy/nix/spoke-module.nix (args // { src = self; });
-
       checks = forAll (pkgs: {
         tests = pkgs.runCommand "tandem-tests" { } ''
           cd ${self}
