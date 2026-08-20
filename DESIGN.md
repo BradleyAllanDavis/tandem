@@ -101,6 +101,31 @@ could act on it. A stray cancel on an already-completed sender copy is
 inert: the retagged watch entry is permanently skipped (never re-observed),
 so it can't cascade to the recipient's copy.
 
+**The retagged flag is hub-durable, not spoke-local (N2, 2026-08-20).**
+Step 4's "already retagged" check used to live in the spoke's own local
+SQLite (`SpokeState.is_retagged`) — which meant a spoke that never
+personally did the retag (a reinstall with empty local state, or a second
+observer coming up alongside an existing one during a topology cutover)
+would see the sender copy's own D2-completed status and misreport it via
+`observe()` as a fresh completion, wrongly completing the recipient's copy
+too. `POST /v1/transfers/{id}/retagged` (`Ledger.mark_retagged()`) moves
+the record to the transfer row itself, so `GET /v1/watch` returns
+`retagged: true` for ANY observer from its first tick, regardless of
+which spoke instance actually performed the retag. See
+things-agent-interaction-model.md §2.6 in the operator's dotfiles for the
+incident this fixes.
+
+Because `mark_retagged()` is a separate hub round-trip from the local
+write, the window between "applied" and "hub-confirmed retagged" can now
+span longer than one tick (e.g. a hub outage) instead of being closed
+within the same tick as before. A genuine cancel/trash of the sender's own
+copy DURING that window is still honored and echoed to the recipient as a
+real cancel — never silently overwritten back to completed. Only a local
+status of "completed" in that window is treated as ambiguous (it may be
+our own D2 write awaiting hub confirmation) and suppressed from
+re-observation; "canceled"/"trashed" are unambiguous (D2 never produces
+them) and always propagate normally.
+
 ### 3.3 Spoke tick (serialized, on a configurable interval — 5s as deployed
 2026-07-11, was 60s)
 

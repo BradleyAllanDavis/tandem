@@ -34,3 +34,6 @@ class DirectHubClient:
 
     def observe(self, transfer_id: str, state: str) -> dict:
         return self.ledger.observe(self.principal, transfer_id, state)
+
+    def mark_retagged(self, transfer_id: str) -> dict:
+        return self.ledger.mark_retagged(self.principal, transfer_id)

@@ -80,6 +80,13 @@ class ApiTest(unittest.TestCase):
         watch_b = b.watch()
         self.assertEqual(watch_b[0]["state"], "applied")
         self.assertEqual(watch_b[0]["role"], "sender")
+        self.assertFalse(watch_b[0]["retagged"])  # N2: hub-durable retag flag, over real HTTP
+
+        b.mark_retagged(rec["id"])
+        watch_b = b.watch()
+        self.assertTrue(watch_b[0]["retagged"])
+        b.mark_retagged(rec["id"])  # idempotent, real HTTP round-trip
+        self.assertTrue(b.watch()[0]["retagged"])
 
         j.observe(rec["id"], "completed")
         echo = b.deliveries()[0]
@@ -99,6 +106,16 @@ class ApiTest(unittest.TestCase):
         d2 = j.deliveries()[0]
         self.assertEqual(d["id"], d2["id"])
         j.ack(d2["id"], dst_uuid="DST-HTTP-2")
+
+    def test_mark_retagged_over_http_rejects_the_recipient(self):
+        b = self.client(self.b_token)
+        j = self.client(self.j_token)
+        rec = b.push_transfer("jill", "SRC-HTTP-RETAG", PAYLOAD)
+        d = j.deliveries()[0]
+        j.ack(d["id"], dst_uuid="DST-HTTP-RETAG")
+        with self.assertRaises(HubHTTPError) as ctx:
+            j.mark_retagged(rec["id"])  # jill is the recipient, not the sender
+        self.assertEqual(ctx.exception.status, 404)
 
     def test_admin_requires_can_admin(self):
         j = self.client(self.j_token)

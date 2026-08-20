@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS transfers (
   payload      TEXT NOT NULL,        -- JSON envelope (PROTOCOL.md)
   terminal     TEXT CHECK (terminal IN ('completed','canceled')),
   terminal_by  TEXT REFERENCES members(id),
+  retagged_at  REAL,                 -- sender's own copy D2-auto-completed (hub-durable,
+                                      -- NOT a terminal observation -- see mark_retagged())
   created_at   REAL NOT NULL,
   applied_at   REAL,
   resolved_at  REAL,
@@ -234,6 +236,7 @@ class Ledger:
         # manages its own explicit transaction instead.
         with self.lock:
             self._migrate_deliveries_dead_letter()
+            self._migrate_transfers_retagged()
 
     def _migrate_deliveries_dead_letter(self) -> None:
         """Additive migration (2026-08-20): add deliveries.next_attempt_at
@@ -307,6 +310,19 @@ class Ledger:
                 raise
         finally:
             self.conn.execute("PRAGMA foreign_keys=ON")
+
+    def _migrate_transfers_retagged(self) -> None:
+        """Additive migration (2026-08-20, N2): add transfers.retagged_at.
+        A plain nullable column with no CHECK/UNIQUE/REFERENCES, so a bare
+        `ALTER TABLE ... ADD COLUMN` suffices -- no rebuild needed (unlike
+        _migrate_deliveries_dead_letter's CHECK-constraint rebuild). A
+        fresh DB never enters this path (_SCHEMA already has the column)."""
+        cols = {row["name"] for row in
+                self.conn.execute("PRAGMA table_info(transfers)")}
+        if "retagged_at" in cols:
+            return  # already current shape (fresh DB, or already migrated)
+        with self.conn:
+            self.conn.execute("ALTER TABLE transfers ADD COLUMN retagged_at REAL")
 
     def close(self) -> None:
         self.conn.close()
@@ -590,16 +606,25 @@ class Ledger:
                     continue  # still backing off
                 # uuid this delivery acts on: the echo recipient acts on their
                 # own copy — src_uuid if they were the sender, dst_uuid if the
-                # recipient (and never before that copy exists).
+                # recipient (and never before that copy exists). to_role tells
+                # the spoke WHICH of the two this echo addresses -- needed
+                # because the two sides apply an echo differently: D2 forces
+                # the sender's own copy to "completed" unconditionally,
+                # regardless of kind, but the recipient must apply the
+                # LITERAL kind (e.g. a sender's post-apply cancel must land
+                # as canceled on the recipient's copy, not completed).
                 if d["kind"] in ("complete", "cancel"):
                     if d["to_member"] == d["from_member"]:
                         uuid_to_act = d["src_uuid"]
+                        to_role = "sender"
                     else:
                         if not d["dst_uuid"]:
                             continue  # recipient hasn't created it yet
                         uuid_to_act = d["dst_uuid"]
+                        to_role = "recipient"
                 else:
                     uuid_to_act = None
+                    to_role = None
                 new_attempts = d["attempts"] + 1
                 self.conn.execute(
                     "UPDATE deliveries SET state='leased', leased_by_device=?,"
@@ -621,6 +646,7 @@ class Ledger:
                     entry["provenance_tag"] = provenance_tag(d["from_handle"])
                 else:
                     entry["uuid"] = uuid_to_act
+                    entry["to_role"] = to_role
                 leased.append(entry)
             return leased
 
@@ -705,7 +731,11 @@ class Ledger:
     # -- watch + observations ----------------------------------------------
     def watchlist(self, p: Principal) -> list:
         """Open transfers this member observes: their own copy's uuid + role.
-        Also carries transfer state so a sender spoke can retag after apply."""
+        Also carries transfer state so a sender spoke can retag after apply,
+        and `retagged` (hub-durable, see mark_retagged()) so ANY observer —
+        not just whichever spoke instance actually did the retag — knows
+        this transfer's sender-side D2 auto-complete has already happened
+        and must never be re-reported as a fresh terminal observation."""
         out = []
         with self.lock:
             rows = self.conn.execute(
@@ -717,11 +747,49 @@ class Ledger:
             state = "applied" if t["applied_at"] else "created"
             if t["from_member"] == p.member_id:
                 out.append({"transfer_id": t["id"], "uuid": t["src_uuid"],
-                            "role": "sender", "state": state})
+                            "role": "sender", "state": state,
+                            "retagged": t["retagged_at"] is not None})
             elif t["dst_uuid"]:
+                # retagged only ever describes the SENDER's own copy (see
+                # mark_retagged()) -- always False here, never meaningful
+                # for a recipient-role entry.
                 out.append({"transfer_id": t["id"], "uuid": t["dst_uuid"],
-                            "role": "recipient", "state": state})
+                            "role": "recipient", "state": state,
+                            "retagged": False})
         return out
+
+    def mark_retagged(self, p: Principal, transfer_id: str) -> dict:
+        """Record that the CALLER's own local copy of `transfer_id` (their
+        role must be sender) was auto-completed via D2 ("delegating IS the
+        action" — spoke/core.py's _retag_sender_copy). Hub-durable and
+        idempotent, so any observer of this transfer — a different spoke
+        instance, a reinstall, a topology change — sees `retagged: true` in
+        watchlist() from its very first tick and never re-reports that
+        local completion as a fresh terminal observation (which would
+        wrongly complete the OTHER party's copy too — see observe()).
+        Deliberately does NOT touch `terminal`: this is not a real
+        completion of the transfer, just a note about the sender's own
+        copy. Requires the transfer to already be applied -- defense in
+        depth: _retag_sender_copy() only ever calls this when
+        watchlist()'s state is already "applied", but requiring it here
+        too means a hypothetical out-of-order or buggy caller can't
+        permanently and silently suppress observation for a transfer
+        nobody has actually delivered yet."""
+        with self.lock, self.conn:
+            t = self.conn.execute(
+                "SELECT id, retagged_at FROM transfers WHERE id=? AND tenant_id=?"
+                " AND from_member=? AND applied_at IS NOT NULL",
+                (transfer_id, p.tenant_id, p.member_id),
+            ).fetchone()
+            if t is None:
+                raise NotFound(
+                    "no such applied transfer for this member as sender")
+            if t["retagged_at"] is None:
+                self.conn.execute(
+                    "UPDATE transfers SET retagged_at=? WHERE id=?",
+                    (time.time(), transfer_id))
+                self._event("sender-retagged", transfer_id, p.device_id, None)
+        return {"ok": True}
 
     def observe(self, p: Principal, transfer_id: str, state: str) -> dict:
         """Report a terminal state seen on a watched copy. Set-once, with the

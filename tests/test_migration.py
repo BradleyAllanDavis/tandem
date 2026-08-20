@@ -213,6 +213,74 @@ class TestDeadLetterMigration(unittest.TestCase):
         self.assertEqual({r["id"] for r in rows2}, set(seeded_ids))
 
 
+class TestRetaggedMigration(unittest.TestCase):
+    """N2 (2026-08-20): transfers gained `retagged_at`. Unlike deliveries'
+    dead_letter migration, this is a plain nullable `ADD COLUMN` (no CHECK/
+    UNIQUE/DEFAULT), so no table rebuild and no fault-injection/rollback
+    test is needed -- just row preservation and idempotency."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "old-ledger.sqlite")
+
+    def _seed_pre_migration_db(self):
+        """Fixture on the schema exactly as it shipped before N2 (transfers
+        table with no retagged_at column) -- the shape a live production
+        ledger predating this change would have."""
+        conn = sqlite3.connect(self.path)
+        conn.executescript(_OLD_SCHEMA)
+        now = time.time()
+        tid, mb, mj = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+        conn.execute("INSERT INTO tenants VALUES (?,?,?)", (tid, "davis", now))
+        conn.execute("INSERT INTO members VALUES (?,?,?,?,?,?,?,?)",
+                     (mb, tid, "bradley", "B", 1, 1, 1, now))
+        conn.execute("INSERT INTO members VALUES (?,?,?,?,?,?,?,?)",
+                     (mj, tid, "jill", "J", 1, 1, 0, now))
+        xfers = [str(uuid.uuid4()), str(uuid.uuid4())]
+        for i, xfer in enumerate(xfers):
+            conn.execute(
+                "INSERT INTO transfers (id, tenant_id, from_member, to_member,"
+                " src_uuid, rev, payload, created_at) VALUES (?,?,?,?,?,?,?,?)",
+                (xfer, tid, mb, mj, f"SRC-{i}", 1, "{}", now))
+        conn.commit()
+        conn.close()
+        return xfers
+
+    def test_migration_preserves_all_rows_and_adds_retagged_column(self):
+        seeded_ids = self._seed_pre_migration_db()
+
+        ledger = Ledger(self.path)  # migration runs inside __init__
+        self.addCleanup(ledger.close)
+
+        cols = {r["name"] for r in
+                ledger.conn.execute("PRAGMA table_info(transfers)")}
+        self.assertIn("retagged_at", cols)
+
+        rows = {r["id"]: dict(r) for r in
+                ledger.conn.execute("SELECT * FROM transfers")}
+        self.assertEqual(set(rows), set(seeded_ids), "no rows lost or added")
+        for tid in seeded_ids:
+            self.assertIsNone(rows[tid]["retagged_at"],
+                              "pre-existing rows report not-yet-retagged")
+
+    def test_migration_is_idempotent_across_reopens(self):
+        seeded_ids = self._seed_pre_migration_db()
+        ledger1 = Ledger(self.path)
+        ledger1.close()
+        ledger2 = Ledger(self.path)  # re-open: must be a no-op, not re-migrate
+        self.addCleanup(ledger2.close)
+        rows = ledger2.conn.execute("SELECT id FROM transfers").fetchall()
+        self.assertEqual({r["id"] for r in rows}, set(seeded_ids))
+
+    def test_fresh_db_never_touches_migration_path(self):
+        path = os.path.join(self.tmp.name, "fresh.sqlite")
+        ledger = Ledger(path)
+        self.addCleanup(ledger.close)
+        cols = {r["name"] for r in
+                ledger.conn.execute("PRAGMA table_info(transfers)")}
+        self.assertIn("retagged_at", cols)
+
 
 if __name__ == "__main__":
     unittest.main()
