@@ -7,6 +7,7 @@ import time
 import unittest
 
 from hub.ledger import AuthError, Forbidden, Ledger, LedgerError, NotFound
+from tests.fakes import FakeClock
 
 PAYLOAD = {"schema": "tandem.todo/1", "title": "buy milk", "notes": "",
            "checklist": [], "when": None, "deadline": None, "context_url": None}
@@ -15,8 +16,13 @@ PAYLOAD = {"schema": "tandem.todo/1", "title": "buy milk", "notes": "",
 class LedgerTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # FakeClock: backoff-eligibility tests advance it explicitly rather
+        # than sleeping past a real threshold (2026-08-20 CI flake fix —
+        # see FakeClock's docstring in tests/fakes.py).
+        self.clock = FakeClock()
         self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
-                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
+                            backoff_base_seconds=1.0, backoff_cap_seconds=2.0,
+                            now_fn=self.clock)
         t = self.ledger.create_tenant("davis")
         self.tenant = t["id"]
         self.bradley = self.ledger.create_member(self.tenant, "bradley", "Bradley",
@@ -97,7 +103,9 @@ class TestDeliveries(LedgerTestBase):
     def test_expired_lease_requeues(self):
         self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
         first = self.ledger.lease_deliveries(self.j, 10, lease_seconds=0.01)
-        time.sleep(0.05)
+        # past BOTH the lease TTL and the (grant-time-stamped) backoff floor
+        # — see FakeClock; LedgerTestBase's backoff_base_seconds=1.0.
+        self.clock.advance(2.0)
         second = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertEqual(first[0]["id"], second[0]["id"])
         self.assertEqual(second[0]["attempts"], 2)
@@ -125,14 +133,15 @@ class TestDeliveries(LedgerTestBase):
 
     def test_nack_requeues(self):
         # Nacked deliveries wait out their backoff floor before becoming
-        # leasable again (2026-08-20 retry policy) — not available in the
-        # same instant, but available once the (test-injected, tiny) backoff
-        # elapses.
+        # leasable again (2026-08-20 retry policy) — not available at the
+        # same clock reading, but available once the backoff elapses.
+        # Deterministic: the fake clock only moves when we say so, so
+        # neither assertion depends on real elapsed wall-clock time.
         self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
         d = self.ledger.lease_deliveries(self.j, 10, 300)[0]
         self.ledger.nack_delivery(self.j, d["id"], "boom")
         self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
-        time.sleep(0.02)  # past the test's injected 0.001s backoff floor
+        self.clock.advance(2.0)  # past the 1.0s backoff floor
         again = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertEqual(len(again), 1)
 
@@ -218,10 +227,14 @@ class TestTerminal(LedgerTestBase):
         d = self.ledger.lease_deliveries(self.j, 10, lease_seconds=0.01)[0]
         del d
         self.ledger.observe(self.b, t["id"], "canceled")
-        time.sleep(0.05)
+        # past BOTH the lease TTL and the (grant-time-stamped) backoff
+        # floor, so the create really is re-leasable here, not just
+        # vacuously absent — see FakeClock; backoff_base_seconds=1.0.
+        self.clock.advance(2.0)
         # create lease expired; the requeued CREATE may be re-leased but no
         # terminal echo may appear before dst_uuid exists
         leased = self.ledger.lease_deliveries(self.j, 10, 300)
+        self.assertTrue(leased, "the create must actually be re-leasable here")
         self.assertTrue(all(e["kind"] == "create" for e in leased))
 
 
@@ -235,9 +248,15 @@ class TestRetryPolicy(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        # FakeClock, not real sleeps — see FakeClock's docstring in
+        # tests/fakes.py (2026-08-20 CI flake fix: a real sleep racing a
+        # small backoff floor is inherently flaky under CI scheduling
+        # variance). Backoff values can be realistic-scale now since
+        # nothing actually waits on them.
+        self.clock = FakeClock()
         self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
-                             max_attempts=3, backoff_base_seconds=0.01,
-                             backoff_cap_seconds=0.02)
+                             max_attempts=3, backoff_base_seconds=10.0,
+                             backoff_cap_seconds=20.0, now_fn=self.clock)
         t = self.ledger.create_tenant("davis")
         self.tenant = t["id"]
         self.bradley = self.ledger.create_member(self.tenant, "bradley", "Bradley",
@@ -258,7 +277,7 @@ class TestRetryPolicy(unittest.TestCase):
         self.ledger.nack_delivery(self.j, d["id"], "boom")
         self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [],
                          "not eligible again until the backoff floor elapses")
-        time.sleep(0.03)
+        self.clock.advance(11.0)  # past the 10s backoff floor
         again = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertEqual(len(again), 1)
         self.assertEqual(again[0]["attempts"], 2)
@@ -271,11 +290,11 @@ class TestRetryPolicy(unittest.TestCase):
             self.assertEqual(len(d), 1, f"attempt {attempt} should still be leasable")
             self.assertEqual(d[0]["attempts"], attempt)
             last = self.ledger.nack_delivery(self.j, d[0]["id"], "still stuck")
-            time.sleep(0.03)
+            self.clock.advance(30.0)  # past backoff, whatever attempt we're on
         self.assertTrue(last.get("dead_letter"),
                         "the 3rd (== max_attempts) nack must dead-letter, not requeue")
         # never leased again, no matter how long we wait
-        time.sleep(0.03)
+        self.clock.advance(3600.0)
         self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
         health = self.ledger.health()
         self.assertEqual(health["dead_letter_deliveries"], 1)
@@ -293,9 +312,9 @@ class TestRetryPolicy(unittest.TestCase):
         delivery, since nothing else will."""
         self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
         for attempt in range(1, 4):  # max_attempts=3, lease TTL so short it
-            d = self.ledger.lease_deliveries(self.j, 10, lease_seconds=0.01)
+            d = self.ledger.lease_deliveries(self.j, 10, lease_seconds=1.0)
             self.assertEqual(len(d), 1, f"attempt {attempt} should still be leasable")
-            time.sleep(0.03)  # let the lease (and any backoff) expire, no ack/nack
+            self.clock.advance(30.0)  # let the lease (and any backoff) expire, no ack/nack
         self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
         self.assertEqual(self.ledger.health()["dead_letter_deliveries"], 1)
 
@@ -308,7 +327,7 @@ class TestRetryPolicy(unittest.TestCase):
         for _ in range(3):
             d = self.ledger.lease_deliveries(self.j, 10, 300)[0]
             self.ledger.nack_delivery(self.j, d["id"], "boom")
-            time.sleep(0.03)
+            self.clock.advance(30.0)
         self.assertEqual(self.ledger.health()["dead_letter_deliveries"], 1)
 
 

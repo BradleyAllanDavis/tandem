@@ -186,7 +186,8 @@ class Ledger:
 
     def __init__(self, db_path: str, max_attempts: int = MAX_ATTEMPTS,
                  backoff_base_seconds: float = BACKOFF_BASE_SECONDS,
-                 backoff_cap_seconds: float = BACKOFF_CAP_SECONDS):
+                 backoff_cap_seconds: float = BACKOFF_CAP_SECONDS,
+                 now_fn=time.time):
         self.db_path = db_path
         # Retry-policy knobs, injectable for tests (same idiom as SpokeCore's
         # correlate_timeout/correlate_interval and FlakyHub's lease_seconds)
@@ -194,6 +195,19 @@ class Ledger:
         self.max_attempts = max_attempts
         self.backoff_base_seconds = backoff_base_seconds
         self.backoff_cap_seconds = backoff_cap_seconds
+        # Clock used ONLY for lease_deliveries' backoff-eligibility check
+        # (2026-08-20 CI flake fix) — every other timestamp in this module
+        # (created_at/applied_at/done_at/last_seen_at/events) still uses
+        # real time.time() directly; only the eligibility comparison needs
+        # to be test-controllable, since asserting "not eligible for
+        # BACKOFF_BASE_SECONDS" against a real sleep is inherently racy
+        # (Python statement overhead alone can exceed a 1ms margin on a
+        # loaded CI runner — confirmed: PR #2's ubuntu-latest leg failed
+        # test_nack_requeues this exact way, unreproducible locally because
+        # it's a real race, not a version difference). Tests inject a fake
+        # clock and advance it explicitly instead of sleeping past a
+        # backoff floor.
+        self._now = now_fn
         self.lock = threading.RLock()
         # Push primitive: a CV with its OWN lock (never the data RLock) and a
         # monotonic generation counter. Every delivery-CREATING commit bumps
@@ -538,7 +552,7 @@ class Ledger:
         """
         if not p.can_receive:
             raise Forbidden("member lacks can_receive")
-        now = time.time()
+        now = self._now()  # injectable clock — see __init__
         with self.lock, self.conn:
             rows = self.conn.execute(
                 "SELECT d.*, t.payload, t.src_uuid, t.dst_uuid, t.terminal,"

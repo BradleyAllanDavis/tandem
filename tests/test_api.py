@@ -10,6 +10,7 @@ import unittest
 from hub.api import make_server
 from hub.ledger import Ledger
 from spoke.hub_http import HttpHubClient, HubHTTPError
+from tests.fakes import FakeClock
 
 PAYLOAD = {"schema": "tandem.todo/1", "title": "水 filter", "notes": "",
            "checklist": ["a", "b"], "when": None, "deadline": None,
@@ -20,8 +21,15 @@ class ApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        # FakeClock, not real sleeps — 2026-08-20 CI flake fix, see
+        # FakeClock's docstring in tests/fakes.py. Safe here even though a
+        # real HTTP server thread serves this ledger: all requests in this
+        # test class are issued synchronously from the single test thread,
+        # so nothing else observes the clock concurrently.
+        cls.clock = FakeClock()
         cls.ledger = Ledger(os.path.join(cls.tmp.name, "ledger.sqlite"),
-                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
+                            backoff_base_seconds=1.0, backoff_cap_seconds=2.0,
+                            now_fn=cls.clock)
         tenant = cls.ledger.create_tenant("davis")["id"]
         bradley = cls.ledger.create_member(tenant, "bradley", "B", can_admin=True)
         jill = cls.ledger.create_member(tenant, "jill", "J")
@@ -78,7 +86,7 @@ class ApiTest(unittest.TestCase):
         b.push_transfer("jill", "SRC-HTTP-2", PAYLOAD)
         d = j.deliveries()[0]
         j.nack(d["id"], "correlation timeout")
-        time.sleep(0.02)  # past the test's injected 0.001s backoff floor
+        self.clock.advance(2.0)  # past the 1.0s backoff floor (deterministic)
         d2 = j.deliveries()[0]
         self.assertEqual(d["id"], d2["id"])
         j.ack(d2["id"], dst_uuid="DST-HTTP-2")

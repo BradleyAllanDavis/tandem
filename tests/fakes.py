@@ -11,6 +11,27 @@ import time
 _counter = itertools.count(1)
 
 
+class FakeClock:
+    """Deterministic, test-controlled clock — injected as Ledger's `now_fn`
+    for any test asserting timing (retry backoff / lease eligibility)
+    instead of sleeping past a real threshold. A real-time sleep racing a
+    small backoff floor is inherently flaky under CI-runner scheduling
+    variance (confirmed 2026-08-20: PR #2's ubuntu-latest leg failed
+    test_nack_requeues this exact way, un-reproducible locally since it's
+    a genuine race, not a version or platform difference) — advancing a
+    fake clock makes "not yet eligible" vs "eligible" assertions exact,
+    with zero real elapsed time and zero flake risk."""
+
+    def __init__(self, start: float = None):
+        self.t = time.time() if start is None else start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
 class CrashAfterFire(Exception):
     """Injected: the write reached Things, the spoke died before ack."""
 
