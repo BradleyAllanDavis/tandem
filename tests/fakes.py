@@ -53,6 +53,11 @@ class FakeReader:
     def __init__(self, things: FakeThings):
         self.things = things
         self.refresh_calls = 0
+        # Injection: force the next N correlate() calls to report "not
+        # found" even when a matching row exists — simulates a genuinely
+        # stuck correlation (title-transformation mismatch, mirror lag)
+        # rather than a crash. Decrements on every call while > 0.
+        self.fail_correlate_times = 0
 
     def refresh(self):
         self.refresh_calls += 1
@@ -78,6 +83,9 @@ class FakeReader:
         return None if t is None else list(t["tags"])
 
     def correlate(self, title, created_after, provenance_tag, exclude_uuids):
+        if self.fail_correlate_times > 0:
+            self.fail_correlate_times -= 1
+            return None
         matches = sorted(
             (t for t in self.things.todos.values()
              if t["title"] == title and t["created"] >= created_after

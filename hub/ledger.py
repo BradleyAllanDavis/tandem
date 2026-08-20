@@ -35,6 +35,20 @@ TERMINAL_STATES = ("completed", "canceled")
 # terminal state -> echo delivery kind
 _ECHO_KIND = {"completed": "complete", "canceled": "cancel"}
 
+# Retry policy (2026-08-20, incident: a stuck delivery retried 1300+ times
+# over a month with no backoff or ceiling). A delivery gets at most
+# MAX_ATTEMPTS leases; between leases it waits out an exponential backoff
+# (attempt N waits BACKOFF_BASE_SECONDS * 2**(N-1), capped at
+# BACKOFF_CAP_SECONDS) before it's eligible to be leased again. Once
+# attempts reaches MAX_ATTEMPTS the delivery is parked in 'dead_letter' —
+# terminal, never leased again, visible via Ledger.health() — instead of
+# retrying forever. Worst case before dead-lettering a create delivery:
+# ~10 real attempts (each up to correlate_timeout, spoke-side) plus ~40min
+# of cumulative backoff — bounded to about an hour, loud, not silent.
+MAX_ATTEMPTS = 10
+BACKOFF_BASE_SECONDS = 10.0
+BACKOFF_CAP_SECONDS = 600.0
+
 # Provenance tag emoji suffix per member handle (2026-07-11) -- matches the
 # emoji already used for these people elsewhere in Bradley's Things/docs
 # (docs/context.md uses "Bradley 👨" / "Jillian 👩"; the pre-existing Things
@@ -104,13 +118,14 @@ CREATE TABLE IF NOT EXISTS deliveries (
   transfer_id       TEXT NOT NULL REFERENCES transfers(id),
   kind              TEXT NOT NULL CHECK (kind IN ('create','complete','cancel')),
   to_member         TEXT NOT NULL REFERENCES members(id),
-  state             TEXT NOT NULL CHECK (state IN ('queued','leased','done')),
+  state             TEXT NOT NULL CHECK (state IN ('queued','leased','done','dead_letter')),
   leased_by_device  TEXT,
   lease_expires_at  REAL,
   attempts          INTEGER NOT NULL DEFAULT 0,
   last_error        TEXT,
   created_at        REAL NOT NULL,
   done_at           REAL,
+  next_attempt_at   REAL,             -- backoff floor; NULL = eligible now
   UNIQUE(transfer_id, kind, to_member)
 );
 
@@ -169,8 +184,16 @@ class Ledger:
     """One connection, one lock — plenty at family scale, and it keeps
     every state transition trivially serializable."""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, max_attempts: int = MAX_ATTEMPTS,
+                 backoff_base_seconds: float = BACKOFF_BASE_SECONDS,
+                 backoff_cap_seconds: float = BACKOFF_CAP_SECONDS):
         self.db_path = db_path
+        # Retry-policy knobs, injectable for tests (same idiom as SpokeCore's
+        # correlate_timeout/correlate_interval and FlakyHub's lease_seconds)
+        # — production code never passes these, it takes the module defaults.
+        self.max_attempts = max_attempts
+        self.backoff_base_seconds = backoff_base_seconds
+        self.backoff_cap_seconds = backoff_cap_seconds
         self.lock = threading.RLock()
         # Push primitive: a CV with its OWN lock (never the data RLock) and a
         # monotonic generation counter. Every delivery-CREATING commit bumps
@@ -187,9 +210,97 @@ class Ledger:
         self.conn.execute("PRAGMA foreign_keys=ON")
         with self.lock, self.conn:
             self.conn.executescript(_SCHEMA)
+        # NOT nested inside the executescript's `with self.conn:` above:
+        # executescript() commits any pending transaction before it runs
+        # and issues no implicit transaction control of its own around the
+        # statements it's given (confirmed empirically 2026-08-20 — a
+        # failing statement mid-script left the prior statements' effects
+        # committed) — so it is NOT safe to use for a multi-statement
+        # table rebuild that must be all-or-nothing. The migration below
+        # manages its own explicit transaction instead.
+        with self.lock:
+            self._migrate_deliveries_dead_letter()
+
+    def _migrate_deliveries_dead_letter(self) -> None:
+        """Additive migration (2026-08-20): add deliveries.next_attempt_at
+        and the 'dead_letter' state. SQLite can't ALTER a CHECK constraint
+        in place, so an already-existing pre-migration table is rebuilt:
+        rename aside, create the current-shape table, copy every row
+        forward (existing rows get next_attempt_at=NULL — eligible
+        immediately, the correct default), validate the row count, THEN
+        drop the old table — all inside one explicit transaction, so a
+        crash or error at any point rolls back to the untouched
+        pre-migration table rather than leaving the DB in a half-rebuilt
+        state (the row-count check must run — and any rollback must
+        happen — BEFORE the old table is dropped, or the check can only
+        report loss after it's already unrecoverable). A fresh DB never
+        enters this path (_SCHEMA already created the final shape, so
+        'next_attempt_at' is already present) — idempotent either way."""
+        cols = {row["name"] for row in
+                self.conn.execute("PRAGMA table_info(deliveries)")}
+        if "next_attempt_at" in cols:
+            return  # already current shape (fresh DB, or already migrated)
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                before = self.conn.execute(
+                    "SELECT COUNT(*) FROM deliveries").fetchone()[0]
+                self.conn.execute(
+                    "ALTER TABLE deliveries RENAME TO deliveries_pre_dead_letter")
+                self.conn.execute("""
+                    CREATE TABLE deliveries (
+                      id                TEXT PRIMARY KEY,
+                      transfer_id       TEXT NOT NULL REFERENCES transfers(id),
+                      kind              TEXT NOT NULL CHECK (kind IN ('create','complete','cancel')),
+                      to_member         TEXT NOT NULL REFERENCES members(id),
+                      state             TEXT NOT NULL CHECK (state IN ('queued','leased','done','dead_letter')),
+                      leased_by_device  TEXT,
+                      lease_expires_at  REAL,
+                      attempts          INTEGER NOT NULL DEFAULT 0,
+                      last_error        TEXT,
+                      created_at        REAL NOT NULL,
+                      done_at           REAL,
+                      next_attempt_at   REAL,
+                      UNIQUE(transfer_id, kind, to_member)
+                    )
+                """)
+                self.conn.execute("""
+                    INSERT INTO deliveries (id, transfer_id, kind, to_member, state,
+                        leased_by_device, lease_expires_at, attempts, last_error,
+                        created_at, done_at, next_attempt_at)
+                      SELECT id, transfer_id, kind, to_member, state,
+                        leased_by_device, lease_expires_at, attempts, last_error,
+                        created_at, done_at, NULL
+                      FROM deliveries_pre_dead_letter
+                """)
+                after = self.conn.execute(
+                    "SELECT COUNT(*) FROM deliveries").fetchone()[0]
+                if after != before:
+                    # still holding deliveries_pre_dead_letter, untouched —
+                    # roll back the whole rebuild, not just this check.
+                    raise LedgerError(
+                        f"deliveries migration row-count mismatch: "
+                        f"{before} before, {after} after — rolling back")
+                # only drop the old table once the copy is verified intact
+                self.conn.execute("DROP TABLE deliveries_pre_dead_letter")
+                self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_deliveries_member_state"
+                    " ON deliveries (to_member, state)")
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
 
     def close(self) -> None:
         self.conn.close()
+
+    def _backoff_seconds(self, attempts: int) -> float:
+        """Backoff floor after the `attempts`-th lease grant."""
+        return min(self.backoff_base_seconds * (2 ** max(attempts - 1, 0)),
+                   self.backoff_cap_seconds)
 
     # -- push primitive ----------------------------------------------------
     def wait_for_delivery(self, timeout: float) -> None:
@@ -415,6 +526,15 @@ class Ledger:
         handed out while that transfer's create delivery to the same member
         isn't done, and never to the recipient before dst_uuid exists —
         the recipient can't complete a todo it hasn't created yet.
+
+        Retry policy (2026-08-20): a delivery that has already burned
+        MAX_ATTEMPTS leases is retired to 'dead_letter' here rather than
+        handed out again — this is the safety net for the case where the
+        spoke crashed/vanished mid-lease without ever calling nack (the
+        explicit-nack path also dead-letters, in nack_delivery, so this
+        only fires for the silent-crash path). A delivery within budget
+        that hasn't waited out its backoff (next_attempt_at) yet is left
+        queued, not handed out.
         """
         if not p.can_receive:
             raise Forbidden("member lacks can_receive")
@@ -427,7 +547,7 @@ class Ledger:
                 " FROM deliveries d"
                 " JOIN transfers t ON t.id = d.transfer_id"
                 " JOIN members fm ON fm.id = t.from_member"
-                " WHERE d.to_member=? AND d.state != 'done'"
+                " WHERE d.to_member=? AND d.state NOT IN ('done', 'dead_letter')"
                 " ORDER BY d.created_at",
                 (p.member_id,),
             ).fetchall()
@@ -437,6 +557,23 @@ class Ledger:
                     break
                 if d["state"] == "leased" and (d["lease_expires_at"] or 0) >= now:
                     continue  # live lease held elsewhere
+                if d["attempts"] >= self.max_attempts:
+                    # crashed mid-lease without an explicit nack — retire it
+                    # here instead of granting attempt N+1. Clears the stale
+                    # lease fields too (matches nack_delivery's dead-letter
+                    # branch) — harmless either way since 'dead_letter' is
+                    # excluded from every future query, but keeps the row
+                    # from showing a misleading "still leased" snapshot.
+                    self.conn.execute(
+                        "UPDATE deliveries SET state='dead_letter',"
+                        " leased_by_device=NULL, lease_expires_at=NULL WHERE id=?",
+                        (d["id"],))
+                    self._event("delivery-dead-lettered", d["tid"], None,
+                                {"delivery": d["id"], "attempts": d["attempts"],
+                                 "reason": "lease-expired-at-max-attempts"})
+                    continue
+                if d["next_attempt_at"] and d["next_attempt_at"] > now:
+                    continue  # still backing off
                 # uuid this delivery acts on: the echo recipient acts on their
                 # own copy — src_uuid if they were the sender, dst_uuid if the
                 # recipient (and never before that copy exists).
@@ -449,14 +586,20 @@ class Ledger:
                         uuid_to_act = d["dst_uuid"]
                 else:
                     uuid_to_act = None
+                new_attempts = d["attempts"] + 1
                 self.conn.execute(
                     "UPDATE deliveries SET state='leased', leased_by_device=?,"
-                    " lease_expires_at=?, attempts=attempts+1 WHERE id=?",
-                    (p.device_id, now + lease_seconds, d["id"]),
+                    " lease_expires_at=?, attempts=?, next_attempt_at=? WHERE id=?",
+                    (p.device_id, now + lease_seconds, new_attempts,
+                     now + self._backoff_seconds(new_attempts), d["id"]),
                 )
                 entry = {
                     "id": d["id"], "transfer_id": d["tid"], "kind": d["kind"],
-                    "attempts": d["attempts"] + 1,
+                    "attempts": new_attempts,
+                    # earliest this delivery could have first fired — lets the
+                    # spoke pre-flight-correlate an already-applied create
+                    # before re-firing it (see spoke/core.py._apply_create).
+                    "created_at": d["created_at"],
                 }
                 if d["kind"] == "create":
                     entry["payload"] = json.loads(d["payload"])
@@ -515,14 +658,28 @@ class Ledger:
         return {"ok": True}
 
     def nack_delivery(self, p: Principal, delivery_id: str, error: str) -> dict:
+        """Report a failed apply attempt. Requeues (behind its backoff, set
+        at the lease that just failed) unless attempts already reached
+        MAX_ATTEMPTS, in which case this is the terminal attempt — the
+        delivery is retired to 'dead_letter' instead of requeued (2026-08-20
+        retry policy; see MAX_ATTEMPTS)."""
         with self.lock, self.conn:
             d = self.conn.execute(
                 "SELECT * FROM deliveries WHERE id=? AND to_member=?",
                 (delivery_id, p.member_id)).fetchone()
             if d is None:
                 raise NotFound("no such delivery for this member")
-            if d["state"] == "done":
+            if d["state"] in ("done", "dead_letter"):
                 return {"ok": True, "already_done": True}
+            if d["attempts"] >= self.max_attempts:
+                self.conn.execute(
+                    "UPDATE deliveries SET state='dead_letter', leased_by_device=NULL,"
+                    " lease_expires_at=NULL, last_error=? WHERE id=?",
+                    (str(error)[:500], delivery_id))
+                self._event("delivery-dead-lettered", d["transfer_id"], p.device_id,
+                            {"delivery": delivery_id, "attempts": d["attempts"],
+                             "reason": "max-attempts", "last_error": str(error)[:500]})
+                return {"ok": True, "dead_letter": True}
             self.conn.execute(
                 "UPDATE deliveries SET state='queued', leased_by_device=NULL,"
                 " lease_expires_at=NULL, last_error=? WHERE id=?",
@@ -645,9 +802,18 @@ class Ledger:
     # -- health -------------------------------------------------------------
     def health(self) -> dict:
         with self.lock:
+            # dead_letter deliveries are terminal (never leased again), so
+            # they're excluded from "pending" (still-actionable) and
+            # reported separately — a stuck delivery should be loud here,
+            # not folded into a count that never distinguishes it from
+            # ordinary in-flight work.
             pending = self.conn.execute(
-                "SELECT COUNT(*) FROM deliveries WHERE state != 'done'").fetchone()[0]
+                "SELECT COUNT(*) FROM deliveries WHERE state NOT IN ('done', 'dead_letter')"
+            ).fetchone()[0]
+            dead_letter = self.conn.execute(
+                "SELECT COUNT(*) FROM deliveries WHERE state='dead_letter'").fetchone()[0]
             open_transfers = self.conn.execute(
                 "SELECT COUNT(*) FROM transfers WHERE resolved_at IS NULL").fetchone()[0]
             return {"ok": True, "pending_deliveries": pending,
+                    "dead_letter_deliveries": dead_letter,
                     "open_transfers": open_transfers}

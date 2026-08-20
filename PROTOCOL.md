@@ -48,12 +48,26 @@ been delivered. A `canceled` arriving after `completed` is ignored.
 queued ──(GET /v1/deliveries)──▶ leased ──(ack)──▶ done
   ▲                                 │
   └──(nack, or lease expiry)────────┘
+  │
+  └──(attempts reaches MAX_ATTEMPTS)──▶ dead_letter
 ```
 
 Ordering guards enforced by the hub: a terminal delivery is never handed to
 the recipient before the transfer has a `dst_uuid`; a terminal echo replaces
 a still-queued create when the sender revoked first (the create is marked
 done/skipped and the transfer resolves).
+
+**Retry policy (2026-08-20).** Each grant of a lease (`GET /v1/deliveries`)
+sets `next_attempt_at = now + backoff(attempts)` — an exponential backoff
+floor (`BACKOFF_BASE_SECONDS * 2**(attempts-1)`, capped at
+`BACKOFF_CAP_SECONDS`) — so a nacked or lease-expired delivery isn't
+re-leasable until that floor elapses. Once `attempts` reaches `MAX_ATTEMPTS`
+the delivery moves to the terminal `dead_letter` state — never leased
+again, whether the caller explicitly nacks (`nack_delivery`) or simply
+vanishes mid-lease (caught on the next `lease_deliveries` call, since
+nothing else would notice a silent crash). `dead_letter` is intentionally
+not `done`: it's a distinct, visible "gave up" state, counted separately in
+`/v1/health` (below), not folded into ordinary completed work.
 
 ## Endpoints
 
@@ -101,7 +115,10 @@ state seen on a watched copy (trashed reports as `canceled`). Set-once
 semantics above; always returns the winning terminal.
 
 ### GET /v1/health
-`{"ok": true, "pending_deliveries": n, "open_transfers": n}`
+`{"ok": true, "pending_deliveries": n, "dead_letter_deliveries": n, "open_transfers": n}`
+— `pending_deliveries` excludes `dead_letter` rows (they're retired, not
+still-actionable); `dead_letter_deliveries` is the loud signal a stuck
+delivery gave up instead of retrying silently forever (2026-08-20).
 
 ### Admin (requires `can_admin`; scoped to the caller's tenant)
 - `POST /v1/admin/tenants {"name"}` — bootstrap-only in practice
@@ -117,6 +134,12 @@ admin API is the runtime escape hatch.
 At-least-once end to end. Every retry path is absorbed by an idempotency
 anchor: transfer replays by the natural key, delivery queueing by
 `(transfer, kind, member)`, applies by the spoke journal (re-correlate,
-don't re-fire), acks by done-state no-ops, observations by set-once
-terminal. The one residual (spoke journal lost AND ack lost in the same
-window) degrades to a single visible duplicate on the recipient side.
+don't re-fire) plus a pre-flight correlate probe against the hub's durable
+`delivery.created_at` when the local journal has no entry at all, acks by
+done-state no-ops, observations by set-once terminal. The one residual
+(spoke journal lost, the pre-flight probe also misses because the
+correlate title genuinely never matches, AND the ack is lost — the same
+window) degrades to a single visible duplicate on the recipient side. That
+window is now also bounded: `MAX_ATTEMPTS` + backoff retire a stuck
+delivery to `dead_letter` instead of retrying forever (retry-policy note,
+above).

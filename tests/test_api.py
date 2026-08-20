@@ -4,6 +4,7 @@ exercised through the same HttpHubClient a deployed spoke uses."""
 import os
 import tempfile
 import threading
+import time
 import unittest
 
 from hub.api import make_server
@@ -19,7 +20,8 @@ class ApiTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.ledger = Ledger(os.path.join(cls.tmp.name, "ledger.sqlite"))
+        cls.ledger = Ledger(os.path.join(cls.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         tenant = cls.ledger.create_tenant("davis")["id"]
         bradley = cls.ledger.create_member(tenant, "bradley", "B", can_admin=True)
         jill = cls.ledger.create_member(tenant, "jill", "J")
@@ -76,6 +78,7 @@ class ApiTest(unittest.TestCase):
         b.push_transfer("jill", "SRC-HTTP-2", PAYLOAD)
         d = j.deliveries()[0]
         j.nack(d["id"], "correlation timeout")
+        time.sleep(0.02)  # past the test's injected 0.001s backoff floor
         d2 = j.deliveries()[0]
         self.assertEqual(d["id"], d2["id"])
         j.ack(d2["id"], dst_uuid="DST-HTTP-2")

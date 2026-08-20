@@ -32,7 +32,8 @@ class InvariantSim(unittest.TestCase):
         rng = random.Random(seed)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        ledger = Ledger(os.path.join(tmp.name, "ledger.sqlite"))
+        ledger = Ledger(os.path.join(tmp.name, "ledger.sqlite"),
+                        backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         self.addCleanup(ledger.close)
         tenant = ledger.create_tenant("davis")["id"]
         members = {
