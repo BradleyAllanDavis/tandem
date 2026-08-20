@@ -70,10 +70,6 @@ CREATE TABLE IF NOT EXISTS journal (
   fired_at    REAL NOT NULL,
   dst_uuid    TEXT
 );
-CREATE TABLE IF NOT EXISTS retagged (
-  transfer_id TEXT PRIMARY KEY,
-  retagged_at REAL NOT NULL
-);
 CREATE TABLE IF NOT EXISTS observed (
   transfer_id TEXT PRIMARY KEY,
   state       TEXT NOT NULL,
@@ -145,17 +141,6 @@ class SpokeState:
             return set(row[0] for row in self.conn.execute(
                 "SELECT dst_uuid FROM journal WHERE dst_uuid IS NOT NULL"))
 
-    def is_retagged(self, transfer_id: str) -> bool:
-        with self._lock:
-            return self.conn.execute(
-                "SELECT 1 FROM retagged WHERE transfer_id=?", (transfer_id,)).fetchone() is not None
-
-    def mark_retagged(self, transfer_id: str) -> None:
-        with self._lock, self.conn:
-            self.conn.execute(
-                "INSERT OR REPLACE INTO retagged (transfer_id, retagged_at)"
-                " VALUES (?,?)", (transfer_id, time.time()))
-
     def last_observed(self, transfer_id: str):
         with self._lock:
             row = self.conn.execute(
@@ -193,8 +178,9 @@ class SpokeCore:
       push_transfer(to, src_uuid, payload, rev) -> {id, deduped, terminal, ...}
       deliveries(limit) -> [delivery]
       ack(delivery_id, dst_uuid=None) / nack(delivery_id, error)
-      watch() -> [{transfer_id, uuid, role, state}]
+      watch() -> [{transfer_id, uuid, role, state, retagged}]
       observe(transfer_id, state) -> dict
+      mark_retagged(transfer_id) -> dict  (hub-durable D2 sender-retag record, N2)
     """
 
     def __init__(self, reader, writer, hub, state: SpokeState,
@@ -401,22 +387,36 @@ class SpokeCore:
             time.sleep(self.correlate_interval)
 
     def _apply_terminal(self, d: dict) -> None:
-        """Terminal echo deliveries only ever address the sender (D2's own
+        """Terminal echo deliveries address EITHER side now (`d["to_role"]`,
+        added alongside N2's pending_retag window -- see
+        _observe_and_retag): most commonly the sender (D2's own
         auto-complete already handles the fast path — see
-        _retag_sender_copy). This is the race-safety-net path: if the
-        recipient resolves their copy before the sender's own next tick gets
-        to retag (the transfer's terminal is then already set, so it drops
-        off the sender's watchlist and _retag_sender_copy never runs for
-        it), this is the only remaining place the sender's copy gets
-        touched. D2 is unconditional — the sender's copy is ALWAYS
-        "completed", never "canceled", regardless of what the recipient did
-        with theirs or which delivery kind carried the echo. Idempotent if
-        _retag_sender_copy already got there first."""
-        ok = self.writer.set_terminal(d["uuid"], "completed")
+        _retag_sender_copy; this is the race-safety-net path for when the
+        recipient resolves their copy before the sender's own next tick
+        gets to retag). For the sender, D2 is unconditional — the sender's
+        copy is ALWAYS "completed", never "canceled", regardless of what
+        the recipient did with theirs or which delivery kind carried the
+        echo. Idempotent if _retag_sender_copy already got there first.
+
+        But a sender can ALSO cancel/trash their own copy for real in the
+        window between apply and retag confirming (_observe_and_retag's
+        pending_retag case) — that genuine cancel queues an echo to the
+        RECIPIENT, and unlike the sender-side case, D2 does NOT apply
+        there: the recipient's copy must reflect the LITERAL kind (a
+        `cancel` echo lands as canceled, not force-completed), or the
+        recipient's real task silently gets marked done for no reason.
+        `to_role` missing (older hub/spoke version mismatch) falls back to
+        the pre-existing sender-side behavior, which was always safe."""
+        if d.get("to_role") == "recipient":
+            state = "completed" if d["kind"] == "complete" else "canceled"
+        else:
+            state = "completed"  # sender-side (or unknown/legacy): D2 is unconditional
+        ok = self.writer.set_terminal(d["uuid"], state)
         if not ok:
             raise RuntimeError(f"terminal apply not verified for {d['uuid']}")
         self.hub.ack(d["id"])
-        _log(f"applied sender-side auto-complete on {d['uuid']} (D2, delivery kind={d['kind']})")
+        _log(f"applied {state} on {d.get('to_role', 'sender')} copy {d['uuid']}"
+             f" (delivery kind={d['kind']})")
 
     # -- 3+4. observations + sender retag -----------------------------------
     def _observe_and_retag(self) -> None:
@@ -426,12 +426,23 @@ class SpokeCore:
             _log(f"watch poll failed: {exc}")
             return
         for w in watch:
-            if w["role"] == "sender" and self.state.is_retagged(w["transfer_id"]):
-                # Already retagged + auto-completed by our own action (D2) —
-                # that "completed" status is our doing, not a fresh signal.
-                # Reporting it via observe() would wrongly echo a completion
-                # to the recipient before they've actually done anything.
+            if w["role"] == "sender" and w.get("retagged"):
+                # Hub-durable (Ledger.mark_retagged(), N2): our own D2
+                # auto-complete of this transfer's sender copy already
+                # happened — on THIS spoke instance or any other, which is
+                # the whole point (a spoke-local flag couldn't survive a
+                # reinstall or a second observer coming up with empty
+                # state; see things-agent-interaction-model.md §2.6). That
+                # "completed" status is our doing, not a fresh signal —
+                # reporting it via observe() would wrongly echo a
+                # completion to the recipient before they've actually done
+                # anything.
                 continue
+            # Applied but not yet hub-confirmed retagged: either the first
+            # D2 attempt, or a prior attempt's local write succeeded while
+            # its hub.mark_retagged() call failed (network blip, hub
+            # restart) and is due a retry.
+            pending_retag = w["role"] == "sender" and w["state"] == "applied"
             status = self.reader.status(w["uuid"])
             if status is None:
                 continue  # not visible (mirror lag) — try next tick
@@ -442,6 +453,20 @@ class SpokeCore:
                 terminal = "completed"
             elif status.get("status") == "canceled":
                 terminal = "canceled"
+            # In the pending_retag window, a LOCAL "completed" status is
+            # ambiguous: it may be OUR OWN D2 write whose hub confirmation
+            # is still outstanding (see _retag_sender_copy) rather than a
+            # fresh signal — reporting it would reopen the exact
+            # two-observer defect this whole change exists to close,
+            # self-inflicted by a transient hub outage instead of a
+            # topology change. "canceled" is NOT ambiguous even in this
+            # window: D2 never produces it, so it's always a genuine user
+            # action (canceling/trashing their own copy before we got to
+            # it) and must be reported normally, exactly as it always was
+            # before this window existed — a stray cancel only became inert
+            # AFTER the retag confirmed (DESIGN.md §3.2), never before.
+            if pending_retag and terminal == "completed":
+                terminal = None
             if terminal and self.state.last_observed(w["transfer_id"]) != terminal:
                 try:
                     self.hub.observe(w["transfer_id"], terminal)
@@ -450,8 +475,7 @@ class SpokeCore:
                 except Exception as exc:
                     _log(f"observation failed for {w['transfer_id']}: {exc}")
                 continue
-            if (w["role"] == "sender" and w["state"] == "applied"
-                    and not self.state.is_retagged(w["transfer_id"])):
+            if pending_retag:
                 self._retag_sender_copy(w)
 
     def _retag_sender_copy(self, w: dict) -> None:
@@ -460,7 +484,12 @@ class SpokeCore:
         tag is the outbound retry queue). D2 (2026-07-11): delegating IS the
         action from the sender's side — their copy is done as soon as the
         handoff is confirmed, symmetric on both directions ("either side"),
-        regardless of what the recipient later does with theirs."""
+        regardless of what the recipient later does with theirs.
+
+        Idempotent and safe to call repeatedly: the local write reapplies
+        the same tags/terminal state, and Ledger.mark_retagged() is a
+        set-once hub call — this is exactly what happens on retry, whether
+        the local write or the hub mark was what failed last time."""
         current = self.reader.tags_of(w["uuid"])
         if current is None:
             return
@@ -476,5 +505,10 @@ class SpokeCore:
         if not self.writer.set_tags_and_terminal(w["uuid"], new_tags, "completed"):
             _log(f"retag+auto-complete not yet verified for {w['uuid']}; will retry next tick")
             return
-        self.state.mark_retagged(w["transfer_id"])
+        try:
+            self.hub.mark_retagged(w["transfer_id"])
+        except Exception as exc:
+            _log(f"mark_retagged failed for {w['transfer_id']}: {exc}; local write "
+                 f"already done, will retry marking the hub next tick")
+            return
         _log(f"retagged + auto-completed sender copy {w['uuid']} -> {DELEGATED_TAG} (D2)")

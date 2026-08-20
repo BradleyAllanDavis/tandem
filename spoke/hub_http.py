@@ -80,5 +80,8 @@ class HttpHubClient:
         return self._request("POST", "/v1/observations",
                              {"transfer_id": transfer_id, "state": state})
 
+    def mark_retagged(self, transfer_id: str) -> dict:
+        return self._request("POST", f"/v1/transfers/{transfer_id}/retagged")
+
     def health(self) -> dict:
         return self._request("GET", "/v1/health")

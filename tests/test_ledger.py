@@ -170,6 +170,7 @@ class TestTerminal(LedgerTestBase):
         self.assertEqual(len(echo), 1)
         self.assertEqual(echo[0]["kind"], "complete")
         self.assertEqual(echo[0]["uuid"], "SRC-1")
+        self.assertEqual(echo[0]["to_role"], "sender")  # bradley is this transfer's sender
         self.ledger.ack_delivery(self.b, echo[0]["id"])
         row = self.ledger.get_transfer(t["id"])
         self.assertIsNotNone(row["resolved_at"])
@@ -221,6 +222,7 @@ class TestTerminal(LedgerTestBase):
         echo = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertEqual([e["kind"] for e in echo], ["cancel"])
         self.assertEqual(echo[0]["uuid"], "DST-1")
+        self.assertEqual(echo[0]["to_role"], "recipient")  # jill is this transfer's recipient
 
     def test_echo_to_recipient_gated_on_dst_uuid(self):
         t = self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
@@ -236,6 +238,76 @@ class TestTerminal(LedgerTestBase):
         leased = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertTrue(leased, "the create must actually be re-leasable here")
         self.assertTrue(all(e["kind"] == "create" for e in leased))
+
+
+class TestRetagged(LedgerTestBase):
+    """N2 (things-agent-interaction-model.md §2.6): the D2 sender-retag
+    record moved from spoke-local state onto the hub (`mark_retagged` /
+    `watchlist()`'s `retagged` field) so it survives a spoke reinstall or a
+    second observer coming up with empty local state."""
+
+    def _applied_transfer(self):
+        t = self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
+        d = self.ledger.lease_deliveries(self.j, 10, 300)[0]
+        self.ledger.ack_delivery(self.j, d["id"], dst_uuid="DST-1")
+        return t
+
+    def test_watchlist_reports_retagged_false_by_default(self):
+        t = self._applied_transfer()
+        [entry] = [w for w in self.ledger.watchlist(self.b)
+                   if w["transfer_id"] == t["id"]]
+        self.assertFalse(entry["retagged"])
+
+    def test_mark_retagged_flips_watchlist_for_any_future_caller(self):
+        """The whole point: a caller who never called mark_retagged
+        themselves -- standing in for a freshly-reinstalled spoke with
+        empty local state -- still sees retagged: true, because it's read
+        off the transfer row, not off who set it."""
+        t = self._applied_transfer()
+        self.ledger.mark_retagged(self.b, t["id"])
+        [entry] = [w for w in self.ledger.watchlist(self.b)
+                   if w["transfer_id"] == t["id"]]
+        self.assertTrue(entry["retagged"])
+
+    def test_mark_retagged_is_idempotent(self):
+        t = self._applied_transfer()
+        self.ledger.mark_retagged(self.b, t["id"])
+        self.ledger.mark_retagged(self.b, t["id"])  # must not raise or flip state
+        [entry] = [w for w in self.ledger.watchlist(self.b)
+                   if w["transfer_id"] == t["id"]]
+        self.assertTrue(entry["retagged"])
+
+    def test_mark_retagged_does_not_set_terminal_or_queue_an_echo(self):
+        """Load-bearing: retagged is NOT a real terminal observation. If it
+        touched `terminal` it would queue a completion echo to the
+        recipient before they'd done anything — the exact bug this fixes,
+        reintroduced a different way."""
+        t = self._applied_transfer()
+        self.ledger.mark_retagged(self.b, t["id"])
+        row = self.ledger.get_transfer(t["id"])
+        self.assertIsNone(row["terminal"])
+        self.assertIsNone(row["resolved_at"])
+        self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
+
+    def test_only_the_sender_can_mark_retagged(self):
+        t = self._applied_transfer()
+        with self.assertRaises(NotFound):
+            self.ledger.mark_retagged(self.j, t["id"])  # jill is the recipient here
+
+    def test_mark_retagged_unknown_transfer(self):
+        with self.assertRaises(NotFound):
+            self.ledger.mark_retagged(self.b, "no-such-transfer")
+
+    def test_mark_retagged_requires_applied(self):
+        """Defense in depth: a transfer that hasn't been applied yet (the
+        recipient's spoke hasn't created+acked it) can't be marked
+        retagged -- _retag_sender_copy() never calls this before
+        watchlist() reports state=="applied", but the hub enforces it too
+        so a hypothetical buggy/out-of-order caller can't permanently
+        suppress observation for a transfer nobody has delivered yet."""
+        t = self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)  # not applied
+        with self.assertRaises(NotFound):
+            self.ledger.mark_retagged(self.b, t["id"])
 
 
 class TestRetryPolicy(unittest.TestCase):

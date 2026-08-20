@@ -91,8 +91,14 @@ Lease TTL 300s; expiry re-queues. Each entry:
 or, for terminal kinds:
 ```json
 {"id": "…", "transfer_id": "…", "kind": "complete|cancel", "attempts": 1,
- "uuid": "the caller's OWN copy's Things uuid"}
+ "uuid": "the caller's OWN copy's Things uuid", "to_role": "sender|recipient"}
 ```
+`to_role` says which side of the transfer this echo addresses — the two
+sides apply an echo differently: the sender's own copy is forced to
+`completed` unconditionally regardless of `kind` (D2, "delegating IS the
+action" — see DESIGN.md), but the recipient must apply the literal `kind`
+(a `cancel` echo — e.g. the sender canceling their own copy after
+apply — lands as `canceled`, never force-completed).
 
 ### POST /v1/deliveries/{id}/ack
 Create kind: `{"dst_uuid": "…"}` (required — this is what closes the uuid
@@ -106,14 +112,32 @@ returns `{"ok": true, "already_done": true}`.
 Open (non-terminal, non-resolved) transfers the caller is party to:
 ```json
 {"watch": [{"transfer_id": "…", "uuid": "their own copy's uuid",
-            "role": "sender|recipient", "state": "created|applied"}]}
+            "role": "sender|recipient", "state": "created|applied",
+            "retagged": false}]}
 ```
 Senders use `state: "applied"` as the retag (delivery-receipt) signal.
+`retagged: true` means the SENDER's own copy already went through D2
+auto-complete (see `POST /v1/transfers/{id}/retagged` below) — recorded on
+the hub, not locally, so it holds regardless of which spoke instance last
+observed this transfer.
 
 ### POST /v1/observations
 `{"transfer_id": "…", "state": "completed|canceled"}` — report a terminal
 state seen on a watched copy (trashed reports as `canceled`). Set-once
 semantics above; always returns the winning terminal.
+
+### POST /v1/transfers/{id}/retagged
+No body. Records that the CALLER's own copy of this transfer (caller must
+be the sender) was auto-completed via D2 ("delegating IS the action" —
+2026-07-11). Idempotent, set-once, hub-durable — any observer of this
+transfer sees `retagged: true` in `GET /v1/watch` from its very first
+tick, so a spoke reinstall or a second observer coming up with empty local
+state can never re-report that local completion as a fresh terminal
+observation (which would wrongly echo a completion to the recipient — see
+things-agent-interaction-model.md §2.6 in the operator's dotfiles).
+Deliberately does NOT set `terminal` — this is not a real completion of
+the transfer, just a note about the sender's own copy. `404` if the caller
+isn't this transfer's sender.
 
 ### GET /v1/health
 `{"ok": true, "pending_deliveries": n, "dead_letter_deliveries": n, "open_transfers": n}`

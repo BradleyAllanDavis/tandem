@@ -212,8 +212,8 @@ class SplitPhaseTest(unittest.TestCase):
 
 class SpokeStateConcurrencyTest(unittest.TestCase):
     """The gateway's two loops (inbound touches journal, local touches
-    sent_cache/observed/retagged) share one SpokeState connection across
-    threads — the added RLock must keep that from erroring/corrupting."""
+    sent_cache/observed) share one SpokeState connection across threads —
+    the added RLock must keep that from erroring/corrupting."""
 
     def test_two_threads_hammer_state(self):
         tmp = tempfile.TemporaryDirectory()

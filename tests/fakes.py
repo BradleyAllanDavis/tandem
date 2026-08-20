@@ -203,3 +203,6 @@ class FlakyHub:
 
     def observe(self, *a, **k):
         return self._call("observe", *a, **k)
+
+    def mark_retagged(self, *a, **k):
+        return self._call("mark_retagged", *a, **k)

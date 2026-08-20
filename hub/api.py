@@ -13,6 +13,7 @@ Surface (PROTOCOL.md has the formal spec):
   POST /v1/deliveries/{id}/nack         {error}
   GET  /v1/watch                        open transfers this member observes
   POST /v1/observations                 {transfer_id, state}
+  POST /v1/transfers/{id}/retagged      sender-side D2 auto-complete, hub-durable
   GET  /v1/health                       liveness + queue depth
   POST /v1/admin/tenants|members|devices, /v1/admin/devices/{id}/revoke
 """
@@ -121,6 +122,13 @@ class ApiHandler(BaseHTTPRequestHandler):
                 rev=int(body.get("rev", 1)),
             )
             return self._send(200 if rec.get("deduped") else 201, rec)
+
+        if parsed.path.startswith("/v1/transfers/"):
+            rest = parsed.path[len("/v1/transfers/"):]
+            if rest.endswith("/retagged"):
+                tid = rest[: -len("/retagged")]
+                return self._send(200, self.ledger.mark_retagged(p, tid))
+            return self._send(404, {"error": "not found"})
 
         if parsed.path.startswith("/v1/deliveries/"):
             rest = parsed.path[len("/v1/deliveries/"):]

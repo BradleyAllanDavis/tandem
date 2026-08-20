@@ -286,6 +286,85 @@ class TestRoundTrip(SpokeCoreTestBase):
         self.settle(3)
         self.assertEqual(self.j_things.todos[src]["status"], "completed")  # unchanged
 
+    def test_fresh_spoke_reinstall_does_not_reecho_prior_retag(self):
+        """N2 regression -- the exact 2026-08-20 two-observer defect
+        (things-agent-interaction-model.md §2.6): a transfer already
+        D2-retagged by b_spoke (hub-durable) must NOT be re-reported as a
+        fresh completion by a SECOND bradley-side spoke instance that
+        never personally did the retag and has empty local state --
+        standing in for a reinstall, or a second observer coming up
+        alongside an existing one during a topology cutover. Before the
+        fix (spoke-local `is_retagged`), this spoke would see the sender's
+        own D2-completed status, treat it as a fresh signal, and wrongly
+        complete jill's real copy."""
+        src = self.b_things.add("deliver", tags=["jill"])
+        self.settle(2)
+        self.assertIn(DELEGATED_TAG, self.b_things.todos[src]["tags"])
+        self.assertEqual(self.b_things.todos[src]["status"], "completed")  # D2
+
+        # Same Things account, same hub principal (bradley), but a
+        # completely fresh (empty) local SpokeState -- what a
+        # reinstalled/new spoke instance looks like.
+        fresh = self._spoke(self.b_things, self.b_writer, self.b_hub,
+                            {"jill": ["jill"]}, "b-state-fresh")
+        fresh.tick()
+        [dst] = [u for u, t in self.j_things.todos.items() if t["title"] == "deliver"]
+        self.assertEqual(self.j_things.todos[dst]["status"], "open")
+
+        # Drive both real spokes forward too -- if fresh.tick() above
+        # wrongly queued a completion echo to jill, this is where it would
+        # actually land on her copy.
+        self.settle(3)
+        self.assertEqual(self.j_things.todos[dst]["status"], "open")
+
+    def test_sender_manual_cancel_during_pending_retag_window_is_honored(self):
+        """N2 fix regression, found in review: the hub-durable retag check
+        made the "applied but not yet retagged" window potentially long
+        (it now survives a hub outage, retried every tick with no
+        give-up), and an earlier version of the fix unconditionally forced
+        the sender's copy back to completed in that window -- silently
+        discarding a genuine cancel/trash the user made themselves, with
+        no error and no signal to the recipient. A cancel in this window
+        must be honored exactly as it always was before this change:
+        reported as a real cancel, propagated to the recipient, and never
+        overwritten back to completed."""
+        src = self.b_things.add("deliver", tags=["jill"])
+        self.settle(1)  # jill's spoke applies the create; bradley hasn't retagged yet
+        self.assertEqual(self.b_things.todos[src]["status"], "open")
+
+        self.b_things.cancel(src)  # bradley cancels his own copy before retag fires
+        self.b_spoke.tick()
+
+        self.assertEqual(self.b_things.todos[src]["status"], "canceled")  # honored
+        self.assertNotIn(DELEGATED_TAG, self.b_things.todos[src]["tags"])  # never retagged
+
+        # Propagates to jill as a genuine cancel, same as the documented
+        # pre-apply revocation path.
+        self.settle(2)
+        [dst] = [u for u, t in self.j_things.todos.items() if t["title"] == "deliver"]
+        self.assertEqual(self.j_things.todos[dst]["status"], "canceled")
+
+    def test_retag_survives_a_lost_mark_retagged_response(self):
+        """N2's own resilience story: hub.mark_retagged() can succeed
+        hub-side but the spoke never hears back (FlakyHub -- the
+        lost-response class, not a real failure). _retag_sender_copy's
+        except branch must not crash the tick, and the NEXT tick must see
+        the hub already has it marked (the response loss didn't mean the
+        write didn't happen) and settle cleanly -- no error, and no
+        re-observation of the ambiguous "completed" status that would
+        wrongly complete jill's real copy."""
+        src = self.b_things.add("deliver", tags=["jill"])
+        self.settle(1)  # jill applies; bradley hasn't retagged yet
+        self.b_hub.drop_next.add("mark_retagged")
+        self.b_spoke.tick()  # local write succeeds; the mark_retagged response is lost
+
+        self.assertEqual(self.b_things.todos[src]["status"], "completed")
+        self.assertIn(DELEGATED_TAG, self.b_things.todos[src]["tags"])
+
+        self.b_spoke.tick()  # must not error, must not re-observe
+        [dst] = [u for u, t in self.j_things.todos.items() if t["title"] == "deliver"]
+        self.assertEqual(self.j_things.todos[dst]["status"], "open")  # never wrongly completed
+
 
 if __name__ == "__main__":
     unittest.main()
