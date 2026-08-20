@@ -4,6 +4,7 @@ redelivery, terminal apply, retag-only-after-applied."""
 
 import os
 import tempfile
+import time
 import unittest
 
 from hub.direct import DirectHubClient
@@ -18,7 +19,8 @@ class SpokeCoreTestBase(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"))
+        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         tenant = self.ledger.create_tenant("davis")["id"]
         b = self.ledger.create_member(tenant, "bradley", "B")
         j = self.ledger.create_member(tenant, "jill", "J")
@@ -128,6 +130,102 @@ class TestInboundCrashSafety(SpokeCoreTestBase):
         self.settle(3)
         self.assertEqual(self.j_things.count_titled("flaky"), 1)
         self.assertEqual(self.j_writer.creates, 1)
+
+    def test_forced_correlation_timeout_retries_produce_exactly_one_todo(self):
+        """Defect 1 regression (2026-08-08 incident): correlate() genuinely
+        can't find the freshly-created todo for several full poll-cycles in
+        a row (title-transformation mismatch / mirror lag, not a crash) —
+        every retry must re-correlate against the SAME journal entry, never
+        re-fire the create. Forces 4 full correlate_timeout cycles (the
+        incident saw 4 failed attempts over 24 minutes) before correlation
+        starts succeeding, then asserts exactly one todo exists throughout
+        and after."""
+        self.b_things.add("flaky title", tags=["jill"])
+        self.b_spoke.tick()  # push the transfer
+        self.j_spoke.reader.fail_correlate_times = 10**6  # "stuck" until cleared
+        for _ in range(4):
+            self.j_spoke.tick()   # attempt 0 fires; every attempt times out -> nack
+            time.sleep(0.02)      # past the test's injected tiny backoff floor
+            self.assertEqual(self.j_writer.creates, 1,
+                             "the create must fire exactly once, ever")
+            self.assertEqual(self.j_things.count_titled("flaky title"), 1,
+                             "exactly one copy exists even while stuck")
+        # correlation starts working (mirror caught up / mismatch resolved)
+        self.j_spoke.reader.fail_correlate_times = 0
+        self.settle(3)
+        self.assertEqual(self.j_writer.creates, 1)
+        self.assertEqual(self.j_things.count_titled("flaky title"), 1)
+        [dst] = [u for u, t in self.j_things.todos.items()
+                if t["title"] == "flaky title"]
+        self.assertIn("from-bradley 👨", self.j_things.todos[dst]["tags"])
+        # the transfer actually resolved (delivery acked, not stuck forever)
+        self.assertEqual(self.ledger.watchlist(self.b_hub.inner.principal)[0]["state"],
+                         "applied")
+
+    def test_preflight_correlate_prevents_refire_after_journal_loss(self):
+        """Defect 1's residual gap: the crash journal is LOCAL-machine
+        state — lost on a reinstall/data wipe (the documented "residual
+        double-failure window" in DESIGN.md/PROTOCOL.md). Simulates that:
+        the create already fired and landed in Things on a prior attempt,
+        but the delivery was never acked AND the journal that would have
+        remembered firing it is gone (a brand-new SpokeState, as after a
+        fresh install). The pre-flight correlate check must find the
+        already-applied copy and adopt it instead of re-firing."""
+        self.b_things.add("already there", tags=["jill"])
+        self.b_spoke.tick()  # push transfer, create delivery queued
+        # Simulate "a prior attempt already fired the create" directly —
+        # the delivery is still queued/unacked at the hub the whole time.
+        self.j_writer.create({"title": "already there", "notes": "",
+                              "checklist": []}, "from-bradley 👨")
+        self.assertEqual(self.j_writer.creates, 1)
+        self.assertEqual(self.j_things.count_titled("already there"), 1)
+        # Fresh journal (empty) standing in for a reinstalled spoke.
+        fresh_state = SpokeState(os.path.join(self.tmp.name, "j-state-fresh.sqlite"))
+        self.j_spoke.state = fresh_state
+        self.j_spoke.tick()  # inbound: journal is empty -> pre-flight correlate
+        self.assertEqual(self.j_writer.creates, 1,  # NOT re-fired
+                         "pre-flight correlate must find the existing copy, not re-fire")
+        self.assertEqual(self.j_things.count_titled("already there"), 1)
+        self.assertEqual(self.ledger.watchlist(self.b_hub.inner.principal)[0]["state"],
+                         "applied")
+
+
+class TestCompletionEchoLongDelay(SpokeCoreTestBase):
+    def test_echo_fires_when_recipient_completes_days_after_delivery(self):
+        """Defect investigation (2026-08-20): six 2026-08-08 deliveries have
+        never echoed a completion back. Hypothesis (a) is "the recipient
+        never actually completed them"; hypothesis (b) is "terminal
+        detection is broken/bounded for old transfers". GET /v1/watch
+        (ledger.watchlist) has no time bound at all — it's a live query for
+        resolved_at IS NULL AND terminal IS NULL, so an open transfer stays
+        on the watchlist and gets re-checked every tick regardless of age.
+        This proves (b) false: backdating the transfer 8 days and THEN
+        completing the recipient's copy must still echo normally."""
+        src = self.b_things.add("old delegation", tags=["jill"])
+        self.settle(2)
+        [dst] = [u for u, t in self.j_things.todos.items()
+                if t["title"] == "old delegation"]
+        # Backdate the transfer as if delivery happened over a week ago —
+        # nothing in the watch/observe path should care.
+        eight_days_ago = time.time() - 8 * 86400
+        with self.ledger.lock, self.ledger.conn:
+            self.ledger.conn.execute(
+                "UPDATE transfers SET created_at=?, applied_at=? WHERE dst_uuid=?",
+                (eight_days_ago, eight_days_ago, dst))
+        # spoke process "restarts" between delivery and completion — fresh
+        # local state, exactly like a real days-later gap; watch() is
+        # server-side so this must not matter either.
+        self.j_spoke.state = SpokeState(
+            os.path.join(self.tmp.name, "j-state-restarted.sqlite"))
+        self.j_things.complete(dst)
+        self.settle(3)
+        self.assertEqual(self.b_things.todos[src]["status"], "completed")  # D2, unchanged
+        self.assertEqual(self.ledger.watchlist(self.b_hub.inner.principal), [])
+        row = self.ledger.get_transfer(
+            [t["id"] for t in self.ledger.conn.execute(
+                "SELECT id FROM transfers WHERE dst_uuid=?", (dst,)).fetchall()][0])
+        self.assertEqual(row["terminal"], "completed")
+        self.assertIsNotNone(row["resolved_at"])
 
 
 class TestRoundTrip(SpokeCoreTestBase):

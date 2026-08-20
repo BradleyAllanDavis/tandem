@@ -128,6 +128,24 @@ re-runs correlation and re-acks instead of re-firing. The residual
 double-failure window (journal loss + lost ack) degrades to one visible
 duplicate in the recipient's Inbox — recoverable by a human, never silent.
 
+**Pre-flight correlate (2026-08-20).** The journal above is local-machine
+state — lost on a reinstall/data wipe, or simply never written if the spoke
+died between the hub granting a lease and `journal_intent()` committing.
+Closing that gap needs a check independent of local state: before firing a
+create with no open journal entry, the spoke does one unblocking
+`correlate()` probe against the *hub's* `delivery.created_at` (durable,
+not local) as the window floor. A hit means a prior attempt already landed
+this exact create — adopt its uuid and ack, never re-fire. A miss proceeds
+to fire normally. See `spoke/core.py::_apply_create`.
+
+**Retry policy (2026-08-20).** A create can still time out correlating
+against a title that genuinely never matches (see PROTOCOL.md's retry-policy
+note) — without a ceiling this retried unboundedly (the incident this was
+written for: 1300+ attempts over a month on one stuck delivery). Each
+delivery now gets at most `MAX_ATTEMPTS` leases, backing off exponentially
+between them; past the ceiling it's retired to `dead_letter` — bounded,
+and visible via `/v1/health` instead of silent.
+
 Hub unreachable: **no spoke-side outbound queue.** Things itself is the
 outbound queue (the tag stays until the hub acked the transfer), and the hub
 is the inbound queue. The spoke backs off and retries.

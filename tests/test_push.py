@@ -33,7 +33,8 @@ class LedgerCVTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"))
+        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         self.addCleanup(self.ledger.close)
         tenant = self.ledger.create_tenant("davis")["id"]
         self.b = self.ledger.create_member(tenant, "bradley", "B")
@@ -108,7 +109,8 @@ class LongPollHttpTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.ledger = Ledger(os.path.join(cls.tmp.name, "ledger.sqlite"))
+        cls.ledger = Ledger(os.path.join(cls.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         tenant = cls.ledger.create_tenant("davis")["id"]
         b = cls.ledger.create_member(tenant, "bradley", "B", can_admin=True)
         j = cls.ledger.create_member(tenant, "jill", "J")
@@ -163,7 +165,8 @@ class SplitPhaseTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"))
+        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         self.addCleanup(self.ledger.close)
         tenant = self.ledger.create_tenant("davis")["id"]
         b = self.ledger.create_member(tenant, "bradley", "B")

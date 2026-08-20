@@ -7,6 +7,7 @@ import time
 import unittest
 
 from hub.ledger import AuthError, Forbidden, Ledger, LedgerError, NotFound
+from tests.fakes import FakeClock
 
 PAYLOAD = {"schema": "tandem.todo/1", "title": "buy milk", "notes": "",
            "checklist": [], "when": None, "deadline": None, "context_url": None}
@@ -15,7 +16,13 @@ PAYLOAD = {"schema": "tandem.todo/1", "title": "buy milk", "notes": "",
 class LedgerTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"))
+        # FakeClock: backoff-eligibility tests advance it explicitly rather
+        # than sleeping past a real threshold (2026-08-20 CI flake fix —
+        # see FakeClock's docstring in tests/fakes.py).
+        self.clock = FakeClock()
+        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=1.0, backoff_cap_seconds=2.0,
+                            now_fn=self.clock)
         t = self.ledger.create_tenant("davis")
         self.tenant = t["id"]
         self.bradley = self.ledger.create_member(self.tenant, "bradley", "Bradley",
@@ -96,7 +103,9 @@ class TestDeliveries(LedgerTestBase):
     def test_expired_lease_requeues(self):
         self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
         first = self.ledger.lease_deliveries(self.j, 10, lease_seconds=0.01)
-        time.sleep(0.05)
+        # past BOTH the lease TTL and the (grant-time-stamped) backoff floor
+        # — see FakeClock; LedgerTestBase's backoff_base_seconds=1.0.
+        self.clock.advance(2.0)
         second = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertEqual(first[0]["id"], second[0]["id"])
         self.assertEqual(second[0]["attempts"], 2)
@@ -123,9 +132,16 @@ class TestDeliveries(LedgerTestBase):
         self.assertTrue(again.get("already_done"))
 
     def test_nack_requeues(self):
+        # Nacked deliveries wait out their backoff floor before becoming
+        # leasable again (2026-08-20 retry policy) — not available at the
+        # same clock reading, but available once the backoff elapses.
+        # Deterministic: the fake clock only moves when we say so, so
+        # neither assertion depends on real elapsed wall-clock time.
         self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
         d = self.ledger.lease_deliveries(self.j, 10, 300)[0]
         self.ledger.nack_delivery(self.j, d["id"], "boom")
+        self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
+        self.clock.advance(2.0)  # past the 1.0s backoff floor
         again = self.ledger.lease_deliveries(self.j, 10, 300)
         self.assertEqual(len(again), 1)
 
@@ -211,11 +227,108 @@ class TestTerminal(LedgerTestBase):
         d = self.ledger.lease_deliveries(self.j, 10, lease_seconds=0.01)[0]
         del d
         self.ledger.observe(self.b, t["id"], "canceled")
-        time.sleep(0.05)
+        # past BOTH the lease TTL and the (grant-time-stamped) backoff
+        # floor, so the create really is re-leasable here, not just
+        # vacuously absent — see FakeClock; backoff_base_seconds=1.0.
+        self.clock.advance(2.0)
         # create lease expired; the requeued CREATE may be re-leased but no
         # terminal echo may appear before dst_uuid exists
         leased = self.ledger.lease_deliveries(self.j, 10, 300)
+        self.assertTrue(leased, "the create must actually be re-leasable here")
         self.assertTrue(all(e["kind"] == "create" for e in leased))
+
+
+class TestRetryPolicy(unittest.TestCase):
+    """Defect 2 regression (2026-08-20 incident: a delivery retried 1300+
+    times over a month with no backoff or ceiling). Its own Ledger with a
+    tiny max_attempts/backoff so the policy's edges (growth, cap, the
+    dead-letter transition, both the explicit-nack path and the silent-
+    crash/lease-expiry path) are exercised fast and deterministically —
+    not the module defaults, which are sized for production, not tests."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        # FakeClock, not real sleeps — see FakeClock's docstring in
+        # tests/fakes.py (2026-08-20 CI flake fix: a real sleep racing a
+        # small backoff floor is inherently flaky under CI scheduling
+        # variance). Backoff values can be realistic-scale now since
+        # nothing actually waits on them.
+        self.clock = FakeClock()
+        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
+                             max_attempts=3, backoff_base_seconds=10.0,
+                             backoff_cap_seconds=20.0, now_fn=self.clock)
+        t = self.ledger.create_tenant("davis")
+        self.tenant = t["id"]
+        self.bradley = self.ledger.create_member(self.tenant, "bradley", "Bradley",
+                                                 can_admin=True)
+        self.jill = self.ledger.create_member(self.tenant, "jill", "Jill")
+        self.b = self.ledger.authenticate(
+            self.ledger.create_device(self.bradley["id"], "gateway")["token"])
+        self.j = self.ledger.authenticate(
+            self.ledger.create_device(self.jill["id"], "air")["token"])
+
+    def tearDown(self):
+        self.ledger.close()
+        self.tmp.cleanup()
+
+    def test_nack_backs_off_before_next_lease(self):
+        self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
+        d = self.ledger.lease_deliveries(self.j, 10, 300)[0]
+        self.ledger.nack_delivery(self.j, d["id"], "boom")
+        self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [],
+                         "not eligible again until the backoff floor elapses")
+        self.clock.advance(11.0)  # past the 10s backoff floor
+        again = self.ledger.lease_deliveries(self.j, 10, 300)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0]["attempts"], 2)
+
+    def test_exhausting_max_attempts_dead_letters_via_explicit_nack(self):
+        self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
+        last = None
+        for attempt in range(1, 4):  # max_attempts=3
+            d = self.ledger.lease_deliveries(self.j, 10, 300)
+            self.assertEqual(len(d), 1, f"attempt {attempt} should still be leasable")
+            self.assertEqual(d[0]["attempts"], attempt)
+            last = self.ledger.nack_delivery(self.j, d[0]["id"], "still stuck")
+            self.clock.advance(30.0)  # past backoff, whatever attempt we're on
+        self.assertTrue(last.get("dead_letter"),
+                        "the 3rd (== max_attempts) nack must dead-letter, not requeue")
+        # never leased again, no matter how long we wait
+        self.clock.advance(3600.0)
+        self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
+        health = self.ledger.health()
+        self.assertEqual(health["dead_letter_deliveries"], 1)
+        self.assertEqual(health["pending_deliveries"], 0)
+        # a further nack on an already-dead-lettered delivery is an inert no-op
+        d_id = self.ledger.conn.execute(
+            "SELECT id FROM deliveries").fetchone()["id"]
+        out = self.ledger.nack_delivery(self.j, d_id, "still stuck")
+        self.assertTrue(out.get("already_done"))
+
+    def test_exhausting_max_attempts_dead_letters_via_lease_expiry(self):
+        """The spoke process vanishes mid-lease without ever calling nack
+        (a genuine crash, not a reported failure) — lease_deliveries itself
+        must catch attempts >= max_attempts on the next poll and retire the
+        delivery, since nothing else will."""
+        self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
+        for attempt in range(1, 4):  # max_attempts=3, lease TTL so short it
+            d = self.ledger.lease_deliveries(self.j, 10, lease_seconds=1.0)
+            self.assertEqual(len(d), 1, f"attempt {attempt} should still be leasable")
+            self.clock.advance(30.0)  # let the lease (and any backoff) expire, no ack/nack
+        self.assertEqual(self.ledger.lease_deliveries(self.j, 10, 300), [])
+        self.assertEqual(self.ledger.health()["dead_letter_deliveries"], 1)
+
+    def test_dead_letter_delivery_never_blocks_the_transfer_forever_silently(self):
+        """A dead-lettered delivery should be loud (visible in health), not
+        a silent black hole — this is the actual complaint behind the
+        incident (1300+ attempts, nobody noticed for a month)."""
+        self.assertEqual(self.ledger.health()["dead_letter_deliveries"], 0)
+        self.ledger.push_transfer(self.b, "jill", "SRC-1", PAYLOAD)
+        for _ in range(3):
+            d = self.ledger.lease_deliveries(self.j, 10, 300)[0]
+            self.ledger.nack_delivery(self.j, d["id"], "boom")
+            self.clock.advance(30.0)
+        self.assertEqual(self.ledger.health()["dead_letter_deliveries"], 1)
 
 
 class TestTenantIsolation(unittest.TestCase):
@@ -223,7 +336,8 @@ class TestTenantIsolation(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"))
+        self.ledger = Ledger(os.path.join(self.tmp.name, "ledger.sqlite"),
+                            backoff_base_seconds=0.001, backoff_cap_seconds=0.01)
         ta = self.ledger.create_tenant("davis")["id"]
         tb = self.ledger.create_tenant("smith")["id"]
         a1 = self.ledger.create_member(ta, "bradley", "Bradley", can_admin=True)

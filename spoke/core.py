@@ -50,6 +50,9 @@ DELEGATED_TAG = "👉 delegated"
 ENVELOPE_SCHEMA = "tandem.todo/1"
 MAX_CHECKLIST = 100
 MAX_NOTES = 10000
+# small clock-skew allowance for correlate windows: mirror timestamps come
+# from another machine.
+CLOCK_SKEW_MARGIN = 120
 
 _STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS sent_cache (
@@ -321,6 +324,27 @@ class SpokeCore:
         journal = self.state.journal_open(d["id"])
         t0 = time.time()
         if journal is None:
+            # Pre-flight: the LOCAL journal is our primary no-refire guard,
+            # but it's local-machine state — lost on a reinstall/data wipe,
+            # or simply never written if a prior process died between the
+            # hub granting this lease and journal_intent() committing. The
+            # hub's delivery.created_at is a hub-durable lower bound on when
+            # this could first have fired, independent of any local state:
+            # a one-shot correlate against it catches "this actually landed
+            # already" before we'd otherwise re-fire (2026-08-20, closing
+            # the residual dup-create gap the crash journal alone doesn't
+            # cover — see DESIGN.md §3.3 and the correlation-timeout
+            # incident this was written for).
+            preflight_after = d.get("created_at", t0)
+            found = self._correlate_once(payload["title"], preflight_after, provenance)
+            if found is not None:
+                self.state.journal_intent(d["id"], d["transfer_id"],
+                                          payload["title"], provenance)
+                self.state.journal_close(d["id"], found)
+                self.hub.ack(d["id"], dst_uuid=found)
+                _log(f"pre-flight correlate found an existing copy for delivery "
+                     f"{d['id']} -> {found}; not re-firing")
+                return
             # journal intent BEFORE firing — crash-restart re-correlates
             # instead of re-firing (no-dup).
             self.state.journal_intent(d["id"], d["transfer_id"],
@@ -345,6 +369,20 @@ class SpokeCore:
         self.hub.ack(d["id"], dst_uuid=dst_uuid)
         _log(f"applied create {d['transfer_id']} -> {dst_uuid}")
 
+    def _correlate_once(self, title: str, created_after: float, provenance_tag: str):
+        """Single unblocking correlate probe — no polling loop. Excludes
+        uuids this spoke has already journaled elsewhere, same as
+        `_correlate`: this delivery has no journal entry of its own yet
+        (that's the only time this is called), but a title collision with a
+        DIFFERENT, already-fully-applied delivery is otherwise possible —
+        without this exclusion a pre-flight hit could wrongly adopt a uuid
+        some other delivery already owns. Used only for the pre-flight
+        already-applied check."""
+        self.reader.refresh()
+        return self.reader.correlate(
+            title, created_after - CLOCK_SKEW_MARGIN, provenance_tag,
+            exclude_uuids=self.state.journaled_dst_uuids())
+
     def _correlate(self, title: str, created_after: float, provenance_tag: str):
         """Read-after-write uuid discovery, bounded. Excludes uuids the hub
         already knows (the reader gets a fresh exclusion set per call via
@@ -352,8 +390,7 @@ class SpokeCore:
         only what this spoke journaled, the natural-key window does the rest)."""
         exclude = self.state.journaled_dst_uuids()
         deadline = time.time() + self.correlate_timeout
-        # small clock-skew allowance: mirror timestamps come from another machine
-        window_start = created_after - 120
+        window_start = created_after - CLOCK_SKEW_MARGIN
         while True:
             self.reader.refresh()
             found = self.reader.correlate(title, window_start, provenance_tag, exclude)
