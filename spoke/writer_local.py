@@ -161,10 +161,19 @@ class LocalWriter:
 
     def _verify(self, check) -> bool:
         """URL applies are async fire-and-forget — never trust `open`
-        returning. Bounded read-back loop against the local mirror."""
+        returning. Bounded read-back loop against the local mirror.
+
+        Does NOT call reader.refresh() per iteration (or at all): refresh()
+        is a synchronous on-demand mirror kickstart (`launchctl kickstart
+        -k`), measured at 4-13s per call and sometimes exceeding its own
+        10s timeout. Calling it on every poll iteration serialized
+        recipient-side deliveries ~10-11s apart (F7). The mirror's own
+        `StartInterval=5` LaunchAgent already keeps it fresh on its own
+        cadence independent of anything this loop does, so polling the
+        mirror directly — same fix as the outbound side (F6, things_db.py
+        MirrorReader.refresh()'s kick_agent contract) — is enough."""
         deadline = time.time() + VERIFY_TIMEOUT
         while time.time() < deadline:
-            self.reader.refresh()
             try:
                 if check():
                     return True
